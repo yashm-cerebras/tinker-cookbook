@@ -6,6 +6,8 @@ import chz
 import datasets
 import tinker
 import torch
+
+# tinker imports
 from tinker import types
 from tinker.types.tensor_data import TensorData
 from tinker_cookbook import checkpoint_utils, model_info, renderers
@@ -77,7 +79,7 @@ def main(config: Config):
     ]
 
     n_train_batches = len(train_dataset) // config.batch_size
-
+    total_tokens_generated = 0
     # Setup training client
     service_client = tinker.ServiceClient(base_url=config.base_url)
 
@@ -85,13 +87,13 @@ def main(config: Config):
     if resume_info:
         training_client = service_client.create_training_client_from_state(
             resume_info["state_path"]
-        )
+        ) 
         start_batch = resume_info["batch"]
         logger.info(f"Resuming from batch {start_batch}")
     else:
         training_client = service_client.create_lora_training_client(
             base_model=config.model_name, rank=config.lora_rank
-        )
+        ) # adds lora config to training client
         start_batch = 0
 
     sampling_params = tinker.types.SamplingParams(
@@ -105,8 +107,10 @@ def main(config: Config):
 
     logger.info(f"Training for {n_train_batches} batches")
 
+    main_trainer_start_time = time.time()
     #  Main training loop
     for batch_idx in range(start_batch, n_train_batches):
+        batch_tokens_generated = 0
         # Setup metrics for logging
         t_start = time.time()
         step = batch_idx
@@ -141,7 +145,7 @@ def main(config: Config):
         batch_prompts: list[list[int]] = []
         for question in batch_rows["question"]:
             convo = [
-                *convo_prefix,
+                *convo_prefix, # they provide few shot examples here, NOTE: CAN be removed
                 {"role": "user", "content": question + question_suffix},
             ]
             model_input = renderer.build_generation_prompt(convo)
@@ -163,7 +167,10 @@ def main(config: Config):
 
         for sample_futures, prompt_tokens, answer in zip(
             batch_futures, batch_prompts, batch_rows["answer"]
-        ):
+        ): # iterating over response, prompt, groundtruth
+            
+
+            # creating new group, rewards, advs per batch
             group_rewards: list[float] = []
             group_tokens: list[list[int]] = []
             group_logprobs: list[list[float]] = []
@@ -174,6 +181,8 @@ def main(config: Config):
                 sampled_logprobs = sample_result.sequences[0].logprobs
                 assert sampled_logprobs is not None
 
+                batch_tokens_generated += len(sampled_tokens)
+                total_tokens_generated += len(sampled_tokens)
                 all_tokens = prompt_tokens + sampled_tokens
                 group_tokens.append(all_tokens)
                 group_ob_lens.append(len(prompt_tokens) - 1)
@@ -219,18 +228,39 @@ def main(config: Config):
                 )
                 training_datums.append(datum)
 
+        train_start = time.time() # training time between forward pass and optim.step
+
         # Training step
         fwd_bwd_future = training_client.forward_backward(
-            training_datums, loss_fn="importance_sampling"
+            training_datums, loss_fn="ppo"
         )
         optim_step_future = training_client.optim_step(adam_params)
         _fwd_bwd_result = fwd_bwd_future.result()
         _optim_result = optim_step_future.result()
 
+        train_elapsed = time.time() - train_start
+        trainer_tokens_processed = sum(len(d.model_input.tokens) for d in training_datums)
+
+
         # Log metrics[]
-        metrics["time/total"] = time.time() - t_start
+        elapsed_time_per_b = time.time() - t_start
+
+        metrics["batch_wall_clock_time/total"] = elapsed_time_per_b
+        metrics["batch_throughput/tokens_per_sec"] = batch_tokens_generated/ elapsed_time_per_b
+        metrics["batch_throughput/questions_per_sec"] = config.batch_size / elapsed_time_per_b
+
+        metrics["trainer/time_elapsed_sec"] = train_elapsed
+        metrics["trainer/tokens_processed"] = trainer_tokens_processed
+        metrics["trainer/throughput/tokens_per_sec"] = trainer_tokens_processed / train_elapsed
+
+        
+
         metrics["reward/mean"] = sum(batch_rewards) / len(batch_rewards)
         ml_logger.log_metrics(metrics, step=batch_idx)
+    
+
+    metrics["global_wall_clock_time/sec"] = time.time() - main_trainer_start_time
+    metrics["global_throughput/tokens_per_sec"] = total_tokens_generated / (time.time() - main_trainer_start_time)
 
         # Save final checkpoint
     checkpoint_utils.save_checkpoint(
